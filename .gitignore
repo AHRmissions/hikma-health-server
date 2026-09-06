@@ -158,3 +158,4 @@ packages/**/.bsb.lock
 *.tsbuildinfo
 
 .docker
+scripts/load-test.js

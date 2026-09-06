@@ -6,8 +6,17 @@ type RateLimiterConfig = {
 type RateLimiterEntry = { timestamps: number[] };
 
 export type RateLimitResult =
-  | { allowed: true }
-  | { allowed: false; retryAfterMs: number };
+  { allowed: true } | { allowed: false; retryAfterMs: number };
+
+const toBoolean = function (s: string) {
+  switch (s) {
+    case "true":
+    case "1":
+      return true;
+  }
+
+  return false;
+};
 
 /**
  * Creates an in-memory sliding-window rate limiter.
@@ -31,6 +40,14 @@ export const createRateLimiter = (config: RateLimiterConfig) => {
 
   return {
     check(key: string): RateLimitResult {
+      const disableRateLimit = toBoolean(
+        process.env.HH_DISABLE_RATE_LIMITING ?? "false",
+      );
+
+      if (disableRateLimit) {
+        return { allowed: true };
+      }
+
       const now = Date.now();
       const entry = store.get(key) ?? { timestamps: [] };
       entry.timestamps = entry.timestamps.filter(
