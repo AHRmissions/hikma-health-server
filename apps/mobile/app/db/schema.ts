@@ -1,4 +1,6 @@
-import { appSchema, tableSchema } from "@nozbe/watermelondb"
+// Subpath import: the package root pulls in the native database bridge, which
+// `syncNormalize` (a pure module) must not need just to read column types.
+import { appSchema, tableSchema } from "@nozbe/watermelondb/Schema"
 
 // WatermelonDB does not support decimal type, so we use string
 // The model then gets a nice "getXYZ" that returns a `parseFloat`

@@ -21,6 +21,8 @@ import * as Sentry from "@sentry/react-native"
 import { toDateSafe } from "@/utils/date"
 import { safeStringify } from "@/utils/parsers"
 
+import schema from "./schema"
+
 /**
  * Count the number of records inside a changeset.
  */
@@ -98,6 +100,42 @@ export const convertToTimestamp = (
   }
 }
 
+/** Column names WatermelonDB stores as numbers, per table. */
+const numberColumnsByTable: Map<string, string[]> = new Map(
+  Object.entries(schema.tables).map(([tableName, tableSchema]) => [
+    tableName,
+    tableSchema.columnArray
+      .filter((column) => column.type === "number")
+      .map((column) => column.name),
+  ]),
+)
+
+/**
+ * Postgres `numeric`/`decimal` columns come back from `pg` as strings — there is
+ * no type parser registered — so `height_cm` arrives as "170.00". WatermelonDB's
+ * `sanitizedRaw` discards any non-number on a number column, silently nulling it,
+ * which is how a synced vitals row loses its height, weight, BMI and temperature
+ * while the integer columns beside them survive.
+ *
+ * Safe by construction: it only rewrites a value the sanitizer is guaranteed to
+ * throw away, so no column can regress. Schema-driven rather than a list of field
+ * names because the failure is silent and a list drifts.
+ *
+ * `Number`, not `parseFloat` — an ISO date must fail here, and parseFloat would
+ * happily read "2026-09-06" as 2026.
+ */
+const coerceNumericStrings = (tableName: string, record: any): void => {
+  const columns = numberColumnsByTable.get(tableName)
+  if (!columns) return
+
+  for (const column of columns) {
+    const value = record[column]
+    if (typeof value !== "string" || value.trim() === "") continue
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) record[column] = parsed
+  }
+}
+
 /**
  * In-place conversion of date strings → timestamps and JSON objects → stringified JSON
  * across all records in a WatermelonDB changeset.
@@ -120,12 +158,32 @@ export const updateDates = (changes: SyncDatabaseChangeSet): void => {
         const recordId = record.id || "unknown"
 
         // Timestamps
-        record.created_at = convertToTimestamp(record.created_at, defaultDate, "created_at", recordId)
-        record.updated_at = convertToTimestamp(record.updated_at, defaultDate, "updated_at", recordId)
+        record.created_at = convertToTimestamp(
+          record.created_at,
+          defaultDate,
+          "created_at",
+          recordId,
+        )
+        record.updated_at = convertToTimestamp(
+          record.updated_at,
+          defaultDate,
+          "updated_at",
+          recordId,
+        )
         if (record.deleted_at)
-          record.deleted_at = convertToTimestamp(record.deleted_at, defaultDate, "deleted_at", recordId)
+          record.deleted_at = convertToTimestamp(
+            record.deleted_at,
+            defaultDate,
+            "deleted_at",
+            recordId,
+          )
         if (record.timestamp)
-          record.timestamp = convertToTimestamp(record.timestamp, defaultDate, "timestamp", recordId)
+          record.timestamp = convertToTimestamp(
+            record.timestamp,
+            defaultDate,
+            "timestamp",
+            recordId,
+          )
         if (record.prescribed_at)
           record.prescribed_at = convertToTimestamp(
             record.prescribed_at,
@@ -134,7 +192,12 @@ export const updateDates = (changes: SyncDatabaseChangeSet): void => {
             recordId,
           )
         if (record.filled_at)
-          record.filled_at = convertToTimestamp(record.filled_at, defaultDate, "filled_at", recordId)
+          record.filled_at = convertToTimestamp(
+            record.filled_at,
+            defaultDate,
+            "filled_at",
+            recordId,
+          )
         if (record.expiration_date)
           record.expiration_date = convertToTimestamp(
             record.expiration_date,
@@ -161,7 +224,7 @@ export const updateDates = (changes: SyncDatabaseChangeSet): void => {
         // column absent from the mobile schema; zeroing it did nothing inbound but
         // wiped the server's value on any outbound path that ran this.
 
-        // ── JSON fields (JSONB → string for WatermelonDB) ───────────
+        // JSON fields (JSONB → string for WatermelonDB) ───────────
         if (record.departments) record.departments = safeStringify(record.departments, "[]")
         if (record.metadata) record.metadata = safeStringify(record.metadata, "{}")
         if (record.form_fields) record.form_fields = safeStringify(record.form_fields, "[]")
@@ -173,6 +236,9 @@ export const updateDates = (changes: SyncDatabaseChangeSet): void => {
         if (record.clinic_ids) record.clinic_ids = safeStringify(record.clinic_ids, "[]")
         if (record.form_data) record.form_data = safeStringify(record.form_data, "[]")
         if (record.fields) record.fields = safeStringify(record.fields, "[]")
+
+        // 🔥 POSTGRESS DECIMAL RECORDS ARE BREAKING NUMERICAL TYPES
+        coerceNumericStrings(type, record)
 
         // date_of_birth (stored as "YYYY-MM-DD" string, not timestamp)
         if (record.date_of_birth !== undefined && record.date_of_birth !== null) {
