@@ -1,3 +1,5 @@
+import { Logger } from "@hikmahealth/js-utils";
+
 type RateLimiterConfig = {
   windowMs: number;
   maxRequests: number;
