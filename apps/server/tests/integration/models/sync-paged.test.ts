@@ -143,11 +143,13 @@ let sinceMark: number;
 let sharedAt: string;
 const seeded: string[] = [];
 let seededPermissionId: string;
+let seededClinicId: string;
 let caller: RequestCaller;
 
 beforeAll(async () => {
   const clinicId = await insertClinic();
   const userId = await insertUser(clinicId);
+  seededClinicId = clinicId;
   caller = makeMobileCaller(userId, clinicId);
 
   sinceMark = Date.now();
@@ -340,6 +342,42 @@ describe("getDeltaPage against a real database", () => {
   it("delivers user_clinic_permissions, which no entity list contains", async () => {
     const { seen } = await drain(3);
     expect(seen).toContain(seededPermissionId);
+  });
+
+  // The fixture above seeds just after `sinceMark`, so it passed even while the
+  // aux fetch filtered on `since`. These rows predate the watermark by 30 days,
+  // and one carries NULL timestamps — the shape a bounded comparison drops
+  // silently.
+  it("delivers auxiliary rows older than the watermark, NULL timestamps included", async () => {
+    // The primary key is (user_id, clinic_id), so each row needs its own user.
+    const addPermission = async (timestamps: Record<string, unknown>) => {
+      const id = uuidV1();
+      createdIds.permissions.push(id);
+      await testDb
+        .insertInto("user_clinic_permissions")
+        .values({
+          id,
+          user_id: await insertUser(seededClinicId),
+          clinic_id: seededClinicId,
+          can_register_patients: true,
+          ...timestamps,
+        } as any)
+        .execute();
+      return id;
+    };
+
+    const oldPermissionId = await addPermission({
+      created_at: sql`now() - interval '30 days'`,
+      updated_at: sql`now() - interval '30 days'`,
+    });
+    const nullTsPermissionId = await addPermission({
+      created_at: null,
+      updated_at: null,
+    });
+
+    const { seen } = await drain(3);
+    expect(seen).toContain(oldPermissionId);
+    expect(seen).toContain(nullTsPermissionId);
   });
 
   it("delivers the auxiliary tables exactly once, on the final page", async () => {

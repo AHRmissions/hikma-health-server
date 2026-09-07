@@ -425,43 +425,29 @@ namespace Sync {
     }
 
     // TODO: Pull out these table right up there near SyncableEntity definitions as a down only list of tables.
-    // Process the user clinic permissions. They dont use last modified or server created attribute
-    result["user_clinic_permissions"] = {
-      created: await applyClinicScope(
-        db
-          .selectFrom("user_clinic_permissions")
-          .where("created_at", ">=", clientLastSyncDate)
-          .selectAll(),
+    // Replicated whole rather than as a delta. Neither table carries
+    // `server_created_at` or `is_deleted`, so neither can join the loop above
+    // to pick up FULL_SNAPSHOT_TABLES — yet both need it: a schema migration
+    // creates them empty on the device, and a delta offers each row once.
+    //
+    // Everything goes in `updated`, as getFullSnapshot does: WatermelonDB
+    // creates a record it is asked to update but does not have.
+    result["user_clinic_permissions"] = createDeltaData(
+      [],
+      await applyClinicScope(
+        db.selectFrom("user_clinic_permissions").selectAll(),
         "user_clinic_permissions",
         hubClinicIds,
       ).execute(),
-      updated: await applyClinicScope(
-        db
-          .selectFrom("user_clinic_permissions")
-          .where("created_at", "<", clientLastSyncDate)
-          .where("updated_at", ">", clientLastSyncDate)
-          .selectAll(),
-        "user_clinic_permissions",
-        hubClinicIds,
-      ).execute(),
-      deleted: [], // THERE are no deleted records. Any record that is gone, is just gone.
-    };
+      [], // THERE are no deleted records. Any record that is gone, is just gone.
+    );
 
-    // Process the app config. They dont use last modified or server created attribute
-    result["app_config"] = {
-      created: await db
-        .selectFrom("app_config")
-        .where("created_at", ">=", clientLastSyncDate)
-        .selectAll()
-        .execute(),
-      updated: await db
-        .selectFrom("app_config")
-        .where("created_at", "<", clientLastSyncDate)
-        .where("updated_at", ">", clientLastSyncDate)
-        .selectAll()
-        .execute(),
-      deleted: [], // THERE are no deleted records. Any record that is gone, is just gone.
-    };
+    // Unscoped by design: devices scope app_config rows on read.
+    result["app_config"] = createDeltaData(
+      [],
+      await db.selectFrom("app_config").selectAll().execute(),
+      [], // THERE are no deleted records. Any record that is gone, is just gone.
+    );
 
     return result;
   };

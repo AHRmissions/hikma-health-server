@@ -250,29 +250,20 @@ const NEXT_BUCKET: Record<Bucket, Bucket | null> = {
 /**
  * Tables the ordinary pull delivers outside the entity lists.
  *
- * `getDeltaRecords` appends these two after its entity loop, and the paged pull
- * has to as well. Omitting them is not a smaller delivery but a permanent one:
- * a completed run advances the client's watermark to its snapshot, so anything
- * inside [since, snapshot] left out here is never asked for again by ordinary
- * sync either. For `user_clinic_permissions` that means a device silently loses
- * clinic access — worst on a first sync, which arrives with `since = 0` and
- * would leave the device with no permission rows at all.
+ * Neither carries `server_created_at`, `last_modified`, `is_deleted` or
+ * `deleted_at` — every column `fetchBucket` filters and sorts on — so they can
+ * neither ride the keyset walk nor opt into `FULL_SNAPSHOT_TABLES`. Both are
+ * instead sent whole on the final page, ignoring the client's watermark: a
+ * schema migration creates them empty on the device, and a delta offers each
+ * row once. The page may overshoot `page_bytes` by their size — both are
+ * small, the same overshoot the cross-table walk already permits.
  *
- * They cannot ride the three-bucket keyset walk: neither carries
- * `server_created_at`, `last_modified`, `is_deleted` or `deleted_at`, which is
- * every column `fetchBucket` filters and sorts on.
- *
- * So they are delivered whole on the final page, as the ordinary pull already
- * does — bounded in practice, since `app_config` is tens of rows and
- * `user_clinic_permissions` one narrow row per user per clinic. The final page
- * can therefore exceed `page_bytes` by their size, the same kind of overshoot
- * the cross-table walk already permits.
- *
- * `deleted` is always empty: neither table soft-deletes.
+ * `deleted` is always empty: neither table soft-deletes, so a row hard-deleted
+ * on the server stays on devices that already hold it.
  */
 const AUX_TABLES = [
-  { table: "user_clinic_permissions", createdCol: "created_at", updatedCol: "updated_at" },
-  { table: "app_config", createdCol: "created_at", updatedCol: "updated_at" },
+  { table: "user_clinic_permissions" },
+  { table: "app_config" },
 ] as const;
 
 /** Delivery names of the auxiliary tables, for tally filtering. */
@@ -281,63 +272,41 @@ export const AUX_DELIVERY_NAMES: readonly string[] = AUX_TABLES.map(
 );
 
 /**
- * Fetch the auxiliary tables whole.
+ * Fetch the auxiliary tables whole, exactly as `getDeltaRecords` does — the two
+ * must agree, since a device recovering through "Sync from…" takes this path.
  *
- * Predicates mirror `getDeltaRecords` exactly — created is `created_at >=
- * since`, updated is `created_at < since AND updated_at > since` — with one
- * addition: both are also bounded above by the run's snapshot. The ordinary
- * pull has no upper bound because it takes its own timestamp at the moment it
- * runs; a paged run must use the snapshot its client will adopt as a watermark,
- * or rows written mid-run would be delivered and then re-requested.
+ * No timestamp bounds: `created_at`/`updated_at` are nullable on both tables,
+ * so any comparison silently drops the rows that have neither.
  */
 async function fetchAuxTables(args: {
-  since: number;
-  ts: number;
   clinicIds: string[] | null;
 }): Promise<{ changes: DeltaPage["changes"]; counts: Record<string, number> }> {
-  const { since, ts, clinicIds } = args;
-  const from = new Date(since);
-  const upper = new Date(ts);
+  const { clinicIds } = args;
 
   const changes: DeltaPage["changes"] = {};
   const counts: Record<string, number> = {};
 
-  for (const { table, createdCol, updatedCol } of AUX_TABLES) {
+  for (const { table } of AUX_TABLES) {
     // `applyClinicScope` filters user_clinic_permissions by its clinic_id and
     // leaves app_config untouched, as the ordinary pull does. app_config now has
     // a `clinic_ids` column but is deliberately absent from
     // `CLINIC_ARRAY_TABLES`: its semantics invert event_forms' (null = all
     // clinics, [] = none), so that jsonb branch would read "scoped to no clinic"
     // as "global". Devices scope these rows on read instead.
-    const created = (await applyClinicScope(
-      db
-        .selectFrom(table as any)
-        .selectAll()
-        .where(createdCol as any, ">=", from)
-        .where(createdCol as any, "<=", upper),
+    const rows = (await applyClinicScope(
+      db.selectFrom(table as any).selectAll(),
       table,
       clinicIds,
     ).execute()) as Record<string, any>[];
 
-    const updated = (await applyClinicScope(
-      db
-        .selectFrom(table as any)
-        .selectAll()
-        .where(createdCol as any, "<", from)
-        .where(updatedCol as any, ">", from)
-        .where(updatedCol as any, "<=", upper),
-      table,
-      clinicIds,
-    ).execute()) as Record<string, any>[];
-
-    if (created.length === 0 && updated.length === 0) continue;
+    if (rows.length === 0) continue;
 
     changes[table] = {
-      created: normalizeCivilDates(table, created),
-      updated: normalizeCivilDates(table, updated),
+      created: [],
+      updated: normalizeCivilDates(table, rows),
       deleted: [],
     };
-    counts[table] = created.length + updated.length;
+    counts[table] = rows.length;
   }
 
   return { changes, counts };
@@ -618,7 +587,7 @@ export async function getDeltaPage(args: {
   // The entity walk is done, so this is the last page — the only one that may
   // carry the unpaged auxiliary tables. Any earlier page would repeat them once
   // per page. See AUX_TABLES.
-  const aux = await fetchAuxTables({ since, ts: pos.ts, clinicIds });
+  const aux = await fetchAuxTables({ clinicIds });
   for (const [table, bucket] of Object.entries(aux.changes)) {
     changes[table] = bucket;
   }

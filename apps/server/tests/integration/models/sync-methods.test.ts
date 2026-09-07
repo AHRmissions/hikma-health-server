@@ -14,11 +14,15 @@ const createdIds: {
   visits: string[];
   clinics: string[];
   users: string[];
+  permissions: string[];
+  appConfigKeys: string[];
 } = {
   patients: [],
   visits: [],
   clinics: [],
   users: [],
+  permissions: [],
+  appConfigKeys: [],
 };
 
 // --- Fixtures ---
@@ -131,6 +135,13 @@ afterEach(async () => {
     await testDb.deleteFrom("visits").where("id", "=", id).execute();
   for (const id of createdIds.patients)
     await testDb.deleteFrom("patients").where("id", "=", id).execute();
+  for (const id of createdIds.permissions)
+    await testDb
+      .deleteFrom("user_clinic_permissions")
+      .where("id", "=", id)
+      .execute();
+  for (const key of createdIds.appConfigKeys)
+    await testDb.deleteFrom("app_config").where("key", "=", key).execute();
   for (const id of createdIds.users)
     await testDb.deleteFrom("users").where("id", "=", id).execute();
   for (const id of createdIds.clinics)
@@ -140,6 +151,8 @@ afterEach(async () => {
   createdIds.patients.length = 0;
   createdIds.users.length = 0;
   createdIds.clinics.length = 0;
+  createdIds.permissions.length = 0;
+  createdIds.appConfigKeys.length = 0;
 });
 
 // --- Tests ---
@@ -200,6 +213,58 @@ describe("Sync.getDeltaRecords (integration)", () => {
     const found = delta.patients.updated.find((r: any) => r.id === patientId);
     expect(found).toBeDefined();
     expect(found.given_name).toBe("UpdatedSync");
+  });
+
+  // A long-lived install's watermark is newer than every row in these two
+  // tables, so a watermarked delta leaves it with no permissions and stale
+  // config forever.
+  it("returns app_config and user_clinic_permissions regardless of the client watermark", async () => {
+    const clinicId = await insertClinic();
+    const userId = await insertUser(clinicId);
+    const caller = makeMobileCaller(userId, clinicId);
+
+    const permissionId = uuidV1();
+    createdIds.permissions.push(permissionId);
+    await testDb
+      .insertInto("user_clinic_permissions")
+      .values({
+        id: permissionId,
+        user_id: userId,
+        clinic_id: clinicId,
+        can_register_patients: true,
+        created_at: sql`now() - interval '30 days'`,
+        updated_at: sql`now() - interval '30 days'`,
+      })
+      .execute();
+
+    const configKey = `sync-watermark-test-${permissionId}`;
+    createdIds.appConfigKeys.push(configKey);
+    await testDb
+      .insertInto("app_config")
+      .values({
+        namespace: "auth",
+        key: configKey,
+        value: "true",
+        data_type: "boolean",
+        created_at: sql`now() - interval '30 days'`,
+        updated_at: sql`now() - interval '30 days'`,
+        last_modified: sql`now() - interval '30 days'`,
+      })
+      .execute();
+
+    const delta = await Sync.getDeltaRecords(Date.now(), "mobile", caller);
+
+    const permission = delta.user_clinic_permissions.updated.find(
+      (r: any) => r.id === permissionId,
+    );
+    expect(permission).toBeDefined();
+    expect(permission.can_register_patients).toBe(true);
+
+    const config = delta.app_config.updated.find(
+      (r: any) => r.key === configKey,
+    );
+    expect(config).toBeDefined();
+    expect(config.value).toBe("true");
   });
 
   it("returns soft-deleted record IDs in the deleted bucket", async () => {
