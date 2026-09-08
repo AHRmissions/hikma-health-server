@@ -11,10 +11,12 @@ import {
   ActivityIndicator,
 } from "react-native"
 import { CameraType, useCameraPermissions, BarcodeScanningResult, CameraView } from "expo-camera"
+import { startOfDay, subDays } from "date-fns"
 import * as SecureStore from "expo-secure-store"
 import { useSelector } from "@xstate/react"
 import { LucideCamera, LucideRefreshCcw } from "lucide-react-native"
 import Toast from "react-native-root-toast"
+import { Q, type Database } from "@nozbe/watermelondb"
 
 import { useIsFocused } from "@react-navigation/native"
 
@@ -41,6 +43,9 @@ import {
 } from "./syncSettingsHelpers"
 import { If } from "@/components/If"
 import { Logger } from "@hikmahealth/js-utils"
+import { Button } from "@/components/Button"
+import { DatePickerButton } from "@/components/DatePicker"
+import { modelClasses } from "@/db/modelClasses"
 
 interface SyncSettingsScreenProps extends AppStackScreenProps<"SyncSettings"> {}
 const { height, width } = Dimensions.get("screen")
@@ -305,7 +310,135 @@ export const SyncSettingsScreen: FC<SyncSettingsScreenProps> = () => {
           <ConnectButton onPress={() => handleAddServer("local")} mode="connect" />
         </View>
       )}
+
+      {/*
+      <View pt={20}>
+        <Text size="lg" text="Dangerous Actions" />
+
+        <MarkRecordsUnsynced />
+      </View>
+      */}
     </Screen>
+  )
+}
+
+const MARK_UNSYNCED_DEFAULT_DAYS_AGO = 5
+
+type MarkUnsyncedRange = { from: number; to: number }
+
+/**
+ * Moves one end of the range and restores the two invariants: `to` never lies
+ * in the future, and `from` never lies after `to`. Total — every timestamp
+ * yields a valid range, so there is no rejected input to report.
+ *
+ * Dragging `to` below `from` collapses the range onto `to` rather than
+ * discarding the change: a correction the user can see beats one they cannot.
+ */
+const applyRangeBound = (
+  range: MarkUnsyncedRange,
+  kind: "from" | "to",
+  timestamp: number,
+  now: number,
+): MarkUnsyncedRange => {
+  if (kind === "to") {
+    const to = Math.min(timestamp, now)
+    return { from: Math.min(range.from, to), to }
+  }
+  return { ...range, from: Math.min(timestamp, range.to) }
+}
+
+function MarkRecordsUnsynced() {
+  const [dateRange, setDateRange] = useState<MarkUnsyncedRange>(() => ({
+    from: startOfDay(subDays(Date.now(), MARK_UNSYNCED_DEFAULT_DAYS_AGO)).getTime(),
+    to: Date.now(),
+  }))
+
+  // The picker bounds below stop the user reaching an invalid date at all; the
+  // clamp catches what they cannot — `maximumDate` is captured at render, so a
+  // dialog left open drifts behind the real "now".
+  const setDateRangeItem = (kind: "from" | "to", timestamp: number) => {
+    setDateRange((range) => applyRangeBound(range, kind, timestamp, Date.now()))
+  }
+
+  const BATCH_SIZE_MAX = 500
+
+  const tables = modelClasses.map((it) => it.table)
+
+  /**
+   * Marks records dirty so the next synchronize() pushes them.
+   * `dateColumn` must be a column on every table in `tables`.
+   * Range is inclusive on both ends.
+   */
+  const markDirtyInRange = async (
+    database: Database,
+    tables: string[],
+    dateColumn: string,
+    fromMs: number,
+    toMs: number,
+  ): Promise<number> => {
+    if (fromMs > toMs) throw new Error("fromMs must be <= toMs")
+
+    let marked = 0
+
+    for (const table of tables) {
+      const records = await database
+        .get(table)
+        .query(Q.where(dateColumn, Q.between(fromMs, toMs)))
+        .fetch()
+
+      for (let i = 0; i < records.length; i += BATCH_SIZE_MAX) {
+        const chunk = records.slice(i, i + BATCH_SIZE_MAX)
+        await database.write(() => database.batch(...chunk.map((r) => r.prepareUpdate(() => {}))))
+        marked += chunk.length
+      }
+    }
+
+    return marked
+  }
+
+  const confirmSetForUpsert = () => {
+    Alert.alert(
+      "Prepare local data for push",
+      "This operation makes local data within the date range ready for upload on the next sync attempt. This is not reversible.",
+      [
+        { text: "Cancel" },
+        {
+          text: "Confirm",
+          onPress: () => {
+            // console.log("no op")
+            markDirtyInRange(db)
+          },
+        },
+      ],
+      { cancelable: true },
+    )
+  }
+
+  return (
+    <View py={5} direction="column" gap={8}>
+      <View direction="row" gap={12}>
+        <View flex={1}>
+          <Text text="From" size="xs" />
+          <DatePickerButton
+            date={new Date(dateRange.from)}
+            onDateChange={(date) => setDateRangeItem("from", date.getTime())}
+            maximumDate={new Date(dateRange.to)}
+          />
+        </View>
+
+        <View flex={1}>
+          <Text text="To" size="xs" />
+          <DatePickerButton
+            date={new Date(dateRange.to)}
+            onDateChange={(date) => setDateRangeItem("to", date.getTime())}
+            minimumDate={new Date(dateRange.from)}
+            maximumDate={new Date()}
+          />
+        </View>
+      </View>
+
+      <Button preset="default" text="Mark All as Dirty" onPress={confirmSetForUpsert} />
+    </View>
   )
 }
 
