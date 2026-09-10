@@ -45,7 +45,8 @@ import { If } from "@/components/If"
 import { Logger } from "@hikmahealth/js-utils"
 import { Button } from "@/components/Button"
 import { DatePickerButton } from "@/components/DatePicker"
-import { modelClasses } from "@/db/modelClasses"
+import database from "@/db"
+import { OUTBOUND_TABLES } from "@/db/localSync"
 
 interface SyncSettingsScreenProps extends AppStackScreenProps<"SyncSettings"> {}
 const { height, width } = Dimensions.get("screen")
@@ -311,13 +312,13 @@ export const SyncSettingsScreen: FC<SyncSettingsScreenProps> = () => {
         </View>
       )}
 
-      {/*
-      <View pt={20}>
-        <Text size="lg" text="Dangerous Actions" />
+      <View pt={20} gap={4}>
+        <Text size="lg" text="Mark local data for sync" />
+        <Text size="xs" text="This makes all data that falls within the date-range available for syncing back to the server." />
+        <Text size="xs" text="Use with care, it is experimental and may have unintended consequences." />
 
         <MarkRecordsUnsynced />
       </View>
-      */}
     </Screen>
   )
 }
@@ -348,6 +349,8 @@ const applyRangeBound = (
 }
 
 function MarkRecordsUnsynced() {
+  const { isSyncing, isSyncActive } = useSync()
+
   const [dateRange, setDateRange] = useState<MarkUnsyncedRange>(() => ({
     from: startOfDay(subDays(Date.now(), MARK_UNSYNCED_DEFAULT_DAYS_AGO)).getTime(),
     to: Date.now(),
@@ -362,7 +365,10 @@ function MarkRecordsUnsynced() {
 
   const BATCH_SIZE_MAX = 500
 
-  const tables = modelClasses.map((it) => it.table)
+  // OUTBOUND_TABLES rather than every collection: event_logs has no updated_at
+  // column to filter on, and peers is device-local — hub URLs and public keys
+  // that must never be handed to a server.
+  const tables = [...OUTBOUND_TABLES]
 
   /**
    * Marks records dirty so the next synchronize() pushes them.
@@ -405,8 +411,34 @@ function MarkRecordsUnsynced() {
         {
           text: "Confirm",
           onPress: () => {
-            // console.log("no op")
-            markDirtyInRange(db)
+            // Re-checked here rather than only on the button: the dialog can sit
+            // open while a sync starts, and the push clears `_status` for every
+            // record in its changeset — marks made behind it are swallowed.
+            if (isSyncActive()) {
+              Alert.alert(
+                "Sync in progress",
+                "Wait for the current sync to finish, then try again.",
+              )
+              return
+            }
+
+            markDirtyInRange(database, tables, "updated_at", dateRange.from, dateRange.to)
+              .then((marked) => {
+                Toast.show(`${marked} records marked for sync`, {
+                  position: Toast.positions.BOTTOM,
+                  duration: Toast.durations.LONG,
+                })
+              })
+              .catch((error) => {
+                Logger.error({ msg: "[SyncSettings] Marking records for sync failed:", error })
+                // Each chunk commits on its own, so a failure part-way through
+                // leaves the tables it already reached marked.
+                // TODO: Claude, log the error in sentry as well
+                Alert.alert(
+                  "Could not mark every record",
+                  "Some records may already have been marked for sync.",
+                )
+              })
           },
         },
       ],
@@ -437,7 +469,13 @@ function MarkRecordsUnsynced() {
         </View>
       </View>
 
-      <Button preset="default" text="Mark All as Dirty" onPress={confirmSetForUpsert} />
+      <Button
+        preset="default"
+        text={isSyncing ? "Sync in progress ..." : "Mark Records for upload"}
+        disabled={isSyncing}
+        disabledStyle={$syncButtonDisabled}
+        onPress={confirmSetForUpsert}
+      />
     </View>
   )
 }

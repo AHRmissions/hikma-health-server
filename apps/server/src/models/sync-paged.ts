@@ -6,7 +6,9 @@ import type { RequestCaller } from "@/types";
 import {
   resolveEntitiesForPeer,
   applyClinicScope,
+  EXEMPT_FROM_HISTORY_LIMIT,
   FULL_SNAPSHOT_TABLES,
+  getMaxHistoryDaysSync,
   syncSelection,
   normalizeCivilDates,
   type SyncEntity,
@@ -322,6 +324,43 @@ async function fetchAuxTables(args: {
 const deliveryName = (entity: SyncEntity): string =>
   entity.Table.mobileName ?? entity.Table.name;
 
+/**
+ * The lower bound one bucket's query runs against.
+ *
+ * An explicit `since` is honoured verbatim — see `getDeltaPage`. A `since` of 0
+ * is a device asking for everything it has never seen, which is the one case
+ * MAX_HISTORY_DAYS_SYNC exists to bound, so the cutoff applies there.
+ *
+ * Measured from the run's snapshot rather than `Date.now()`, so every page of a
+ * backfill spanning hours shares one boundary.
+ *
+ * Two exemptions, both load-bearing:
+ *
+ * `deleted` never clamps. A `since` of 0 does not mean an empty device on this
+ * path — a device populated from a hub reaches first sync with `last_pulled_at`
+ * unset — and a skipped tombstone is stranded for good, because the completed
+ * run moves the watermark past it.
+ *
+ * Config entities never clamp, as on the ordinary pull: a device without the
+ * event_form an event references cannot render that event, however recent the
+ * event is.
+ */
+const lowerBound = (
+  since: number,
+  ts: number,
+  table: string,
+  bucket: Bucket,
+): Date => {
+  if (since !== 0) return new Date(since);
+  if (bucket === "deleted") return new Date(since);
+  if (EXEMPT_FROM_HISTORY_LIMIT.includes(table)) return new Date(since);
+
+  const maxHistoryDays = getMaxHistoryDaysSync();
+  if (maxHistoryDays === null) return new Date(since);
+
+  return new Date(ts - maxHistoryDays * 24 * 60 * 60 * 1000);
+};
+
 /** One keyset query for a single entity/bucket. */
 async function fetchBucket(args: {
   entity: SyncEntity;
@@ -336,8 +375,7 @@ async function fetchBucket(args: {
   const { entity, bucket, since, ts, key, limit, clinicIds, peerType } = args;
   const table = entity.Table.name;
   const sortCol = SORT_COLUMN[bucket];
-  // MAX_HISTORY_DAYS_SYNC is deliberately not applied here — see getDeltaPage.
-  const from = new Date(since);
+  const from = lowerBound(since, ts, table, bucket);
   const upper = new Date(ts);
 
   /**
@@ -454,16 +492,17 @@ async function fetchBucket(args: {
  * therefore cannot shift pages; they are picked up by the client's next sync,
  * whose cursor is this `ts`.
  *
- * `since` is honoured verbatim. Unlike `getDeltaRecords`, this does not raise
- * the lower bound to MAX_HISTORY_DAYS_SYNC: that limit bounds the history
- * routine sync keeps pushing at a device, while this is the recovery path whose
- * purpose is to fetch that history back. Routine sync must not route through
- * here.
+ * An explicit `since` is honoured verbatim. Unlike `getDeltaRecords`, this does
+ * not raise it to MAX_HISTORY_DAYS_SYNC: that limit bounds the history routine
+ * sync keeps pushing at a device, while this is the recovery path whose purpose
+ * is to fetch that history back. Routine sync must not route through here.
  *
- * Restoring the clamp would not narrow a run but empty it — both non-deleted
+ * Clamping such a run would not narrow it but empty it — both non-deleted
  * buckets share one lower bound, so a record older than the cutoff and
  * untouched since matches neither, and the completed run then moves the
  * client's watermark past the gap.
+ *
+ * A `since` of 0 is the exception, applied in `lowerBound`.
  */
 export async function getDeltaPage(args: {
   since: number;
