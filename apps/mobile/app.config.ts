@@ -16,6 +16,9 @@ module.exports = ({ config }: ConfigContext): Partial<ExpoConfig> => {
 
   return {
     ...config,
+    android: {
+      ...config.android,
+    },
     ios: {
       ...config.ios,
       // This privacyManifests is to get you started.
@@ -39,6 +42,7 @@ module.exports = ({ config }: ConfigContext): Partial<ExpoConfig> => {
 
       require("./plugins/withSplashScreen").withSplashScreen,
       require("./plugins/withWatermelon").withWatermelon,
+      require("./plugins/withLargeHeap").withLargeHeap,
     ],
   }
 }
