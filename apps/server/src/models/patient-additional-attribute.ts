@@ -9,8 +9,10 @@ import type {
 } from "kysely";
 import db from "@/db";
 import { createServerOnlyFn } from "@tanstack/react-start";
-import { sql } from "kysely";
+import type { DB } from "@hikmahealth/database/types/schema/hh";
+import { sql, type InsertObject } from "kysely";
 import { safeJSONParse, toSafeDateString } from "@/lib/utils";
+import type { SyncBatchUpsert } from "@/types";
 
 namespace PatientAdditionalAttribute {
   export type T = {
@@ -111,60 +113,125 @@ namespace PatientAdditionalAttribute {
 
   export namespace API {
     /**
+     * The identity Postgres resolves conflicts on, as a lookup key. Joined on
+     * NUL because neither half excludes any given separator, and a collision
+     * would credit one attribute's write to another.
+     */
+    const conflictKey = (attribute: {
+      patient_id: string;
+      attribute_id: string;
+    }): string => `${attribute.patient_id}\u0000${attribute.attribute_id}`;
+
+    /**
+     * The column values one attribute writes, shared by the single-record and
+     * batched upserts.
+     */
+    const toInsertRow = (
+      attribute: PatientAdditionalAttribute.EncodedT,
+    ): InsertObject<DB, "patient_additional_attributes"> => ({
+      id: attribute.id,
+      patient_id: attribute.patient_id,
+      attribute_id: attribute.attribute_id,
+      attribute: attribute.attribute,
+      number_value: attribute.number_value || null,
+      string_value: attribute.string_value || null,
+      date_value: attribute.date_value
+        ? sql`${toSafeDateString(
+            attribute.date_value,
+          )}::timestamp with time zone`
+        : null,
+      boolean_value: attribute.boolean_value || null,
+      metadata: sql`${JSON.stringify(
+        safeJSONParse(attribute.metadata, {}),
+      )}::jsonb`,
+      is_deleted: attribute.is_deleted,
+      created_at: sql`${toSafeDateString(
+        attribute.created_at,
+      )}::timestamp with time zone`,
+      updated_at: sql`${toSafeDateString(
+        attribute.updated_at,
+      )}::timestamp with time zone`,
+      last_modified: sql`now()::timestamp with time zone`,
+      server_created_at: sql`now()::timestamp with time zone`,
+      deleted_at: null,
+    });
+
+    /**
+     * Insert `rows`, letting a newer incoming record overwrite the stored one.
+     *
+     * Conflicts resolve on (patient_id, attribute_id) rather than the primary
+     * key, because that pair is an attribute's real identity — two devices can
+     * mint different ids for the same one.
+     */
+    const upsertRows = (
+      rows: InsertObject<DB, "patient_additional_attributes">[],
+    ) =>
+      db
+        .insertInto(PatientAdditionalAttribute.Table.name)
+        .values(rows)
+        .onConflict((oc) =>
+          oc.columns(["patient_id", "attribute_id"]).doUpdateSet({
+            patient_id: (eb) => eb.ref("excluded.patient_id"),
+            attribute_id: (eb) => eb.ref("excluded.attribute_id"),
+            attribute: (eb) => eb.ref("excluded.attribute"),
+            number_value: (eb) => eb.ref("excluded.number_value"),
+            string_value: (eb) => eb.ref("excluded.string_value"),
+            date_value: (eb) => eb.ref("excluded.date_value"),
+            boolean_value: (eb) => eb.ref("excluded.boolean_value"),
+            metadata: (eb) => eb.ref("excluded.metadata"),
+            is_deleted: (eb) => eb.ref("excluded.is_deleted"),
+            updated_at: sql`now()::timestamp with time zone`,
+            last_modified: sql`now()::timestamp with time zone`,
+          })
+          // Only update if the incoming record is newer than what's already stored
+          .where(sql<boolean>`excluded.updated_at > patient_additional_attributes.updated_at`),
+        );
+
+    /**
      * Upsert a patient additional attribute
      */
     export const upsert = createServerOnlyFn(
       async (attribute: PatientAdditionalAttribute.EncodedT) => {
-        return await db
-          .insertInto(PatientAdditionalAttribute.Table.name)
-          .values({
-            id: attribute.id,
-            patient_id: attribute.patient_id,
-            attribute_id: attribute.attribute_id,
-            attribute: attribute.attribute,
-            number_value: attribute.number_value || null,
-            string_value: attribute.string_value || null,
-            date_value: attribute.date_value
-              ? sql`${toSafeDateString(
-                  attribute.date_value,
-                )}::timestamp with time zone`
-              : null,
-            boolean_value: attribute.boolean_value || null,
-            metadata: sql`${JSON.stringify(
-              safeJSONParse(attribute.metadata, {}),
-            )}::jsonb`,
-            is_deleted: attribute.is_deleted,
-            created_at: sql`${toSafeDateString(
-              attribute.created_at,
-            )}::timestamp with time zone`,
-            updated_at: sql`${toSafeDateString(
-              attribute.updated_at,
-            )}::timestamp with time zone`,
-            last_modified: sql`now()::timestamp with time zone`,
-            server_created_at: sql`now()::timestamp with time zone`,
-            deleted_at: null,
-          })
-          .onConflict((oc) =>
-            oc.columns(["patient_id", "attribute_id"]).doUpdateSet({
-              patient_id: (eb) => eb.ref("excluded.patient_id"),
-              attribute_id: (eb) => eb.ref("excluded.attribute_id"),
-              attribute: (eb) => eb.ref("excluded.attribute"),
-              number_value: (eb) => eb.ref("excluded.number_value"),
-              string_value: (eb) => eb.ref("excluded.string_value"),
-              date_value: (eb) => eb.ref("excluded.date_value"),
-              boolean_value: (eb) => eb.ref("excluded.boolean_value"),
-              metadata: (eb) => eb.ref("excluded.metadata"),
-              is_deleted: (eb) => eb.ref("excluded.is_deleted"),
-              updated_at: sql`now()::timestamp with time zone`,
-              last_modified: sql`now()::timestamp with time zone`,
-            })
-            // Only update if the incoming record is newer than what's already stored
-            .where(sql<boolean>`excluded.updated_at > patient_additional_attributes.updated_at`),
-          )
-          .executeTakeFirst();
+        // The InsertResult's row count is what sync reads to tell an applied
+        // write from one the staleness guard skipped.
+        return await upsertRows([toInsertRow(attribute)]).executeTakeFirst();
+      },
+    );
 
-        // Log when the updated_at guard skips a stale record
-        // Note: result is the InsertResult, which is undefined when no row was touched
+    /**
+     * Upsert many attributes in one statement.
+     *
+     * `RETURNING` names the conflict key rather than the id: on a conflict the
+     * stored row keeps its own id, so the id that comes back need not be the
+     * one the client sent — the key is what maps a written row back to it.
+     */
+    export const upsertMany = createServerOnlyFn(
+      async (
+        attributes: readonly PatientAdditionalAttribute.EncodedT[],
+      ): Promise<SyncBatchUpsert<PatientAdditionalAttribute.EncodedT>> => {
+        const batched: PatientAdditionalAttribute.EncodedT[] = [];
+        const deferred: PatientAdditionalAttribute.EncodedT[] = [];
+        const claimed = new Set<string>();
+        for (const attribute of attributes) {
+          const key = conflictKey(attribute);
+          if (claimed.has(key)) {
+            deferred.push(attribute);
+            continue;
+          }
+          claimed.add(key);
+          batched.push(attribute);
+        }
+        if (batched.length === 0) return { acceptedIds: [], deferred };
+
+        const written = await upsertRows(batched.map(toInsertRow))
+          .returning(["patient_id", "attribute_id"])
+          .execute();
+
+        const writtenKeys = new Set(written.map(conflictKey));
+        const acceptedIds = batched
+          .filter((attribute) => writtenKeys.has(conflictKey(attribute)))
+          .map((attribute) => String(attribute.id));
+        return { acceptedIds, deferred };
       },
     );
 
@@ -190,6 +257,12 @@ namespace PatientAdditionalAttribute {
     export const upsertFromDelta = createServerOnlyFn(
       async (delta: PatientAdditionalAttribute.EncodedT) => {
         return API.upsert(delta);
+      },
+    );
+
+    export const upsertManyFromDelta = createServerOnlyFn(
+      async (deltas: readonly PatientAdditionalAttribute.EncodedT[]) => {
+        return API.upsertMany(deltas);
       },
     );
 

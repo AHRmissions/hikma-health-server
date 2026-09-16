@@ -6,6 +6,7 @@ import {
   toSafeDateString,
 } from "@/lib/utils";
 import { createServerOnlyFn } from "@tanstack/react-start";
+import type { DB } from "@hikmahealth/database/types/schema/hh";
 import { Option } from "effect";
 import {
   type ColumnType,
@@ -14,6 +15,7 @@ import {
   type Insertable,
   type Updateable,
   type JSONColumnType,
+  type InsertObject,
   sql,
 } from "kysely";
 import { jsonObjectFrom } from "kysely/helpers/postgres";
@@ -22,6 +24,7 @@ import EventProblems from "@/models/event-problems";
 import Visit from "./visit";
 import Patient from "./patient";
 import { Logger } from "@hikmahealth/js-utils";
+import type { SyncBatchUpsert } from "@/types";
 
 namespace Event {
   export type T = {
@@ -166,6 +169,69 @@ namespace Event {
       },
     );
 
+    /**
+     * The column values one event writes, shared by the single-record and
+     * batched paths.
+     */
+    const toInsertRow = (
+      event: Event.EncodedT,
+      id: string,
+      visitId: string | null,
+    ): InsertObject<DB, "events"> => ({
+      id,
+      patient_id: event.patient_id,
+      form_id: event.form_id,
+      event_type: event.event_type,
+      visit_id: visitId,
+      form_data: sql`${JSON.stringify(
+        safeJSONParse(event.form_data, []),
+      )}::jsonb`,
+      metadata: sql`${JSON.stringify(
+        safeJSONParse(event.metadata, {}),
+      )}::jsonb`,
+      is_deleted: false,
+      created_at: sql`${toSafeDateString(
+        event.created_at,
+      )}::timestamp with time zone`,
+      updated_at: sql`${toSafeDateString(
+        event.updated_at,
+      )}::timestamp with time zone`,
+      last_modified: sql`now()::timestamp with time zone`,
+      server_created_at: sql`now()::timestamp with time zone`,
+      deleted_at: null,
+      // `||` not `??`: fielded clients send "" for an unattributed event
+      // (WatermelonDB backfills non-optional string columns with ""), and
+      // "" is not a valid uuid literal.
+      recorded_by_user_id: event.recorded_by_user_id || null,
+    });
+
+    /** Insert `rows`, letting a newer incoming event overwrite the stored one. */
+    const upsertRows = (rows: InsertObject<DB, "events">[]) =>
+      db
+        .insertInto(Event.Table.name)
+        .values(rows)
+        .onConflict((oc) => {
+          return (
+            oc
+              .column("id")
+              .doUpdateSet({
+                patient_id: (eb) => eb.ref("excluded.patient_id"),
+                visit_id: (eb) => eb.ref("excluded.visit_id"),
+                form_id: (eb) => eb.ref("excluded.form_id"),
+                event_type: (eb) => eb.ref("excluded.event_type"),
+                form_data: (eb) => eb.ref("excluded.form_data"),
+                metadata: (eb) => eb.ref("excluded.metadata"),
+                is_deleted: (eb) => eb.ref("excluded.is_deleted"),
+                recorded_by_user_id: (eb) =>
+                  eb.ref("excluded.recorded_by_user_id"),
+                updated_at: sql`now()::timestamp with time zone`,
+                last_modified: sql`now()::timestamp with time zone`,
+              })
+              // Only update if the incoming record is newer than what's already stored
+              .where(sql<boolean>`excluded.updated_at > events.updated_at`)
+          );
+        });
+
     // FIXME: Events should only be created if the visit_id is present and the visit exists. Update!
     export const save = createServerOnlyFn(
       async (id: string | null, event: Event.EncodedT) => {
@@ -236,57 +302,9 @@ namespace Event {
             visitId = insertVisitId;
           }
 
-          return await db
-            .insertInto(Event.Table.name)
-            .values({
-              id: id || event.id || uuidV1(),
-              patient_id: event.patient_id,
-              form_id: event.form_id,
-              event_type: event.event_type,
-              visit_id: visitId,
-              form_data: sql`${JSON.stringify(
-                safeJSONParse(event.form_data, []),
-              )}::jsonb`,
-              metadata: sql`${JSON.stringify(
-                safeJSONParse(event.metadata, {}),
-              )}::jsonb`,
-              is_deleted: false,
-              created_at: sql`${toSafeDateString(
-                event.created_at,
-              )}::timestamp with time zone`,
-              updated_at: sql`${toSafeDateString(
-                event.updated_at,
-              )}::timestamp with time zone`,
-              last_modified: sql`now()::timestamp with time zone`,
-              server_created_at: sql`now()::timestamp with time zone`,
-              deleted_at: null,
-              // `||` not `??`: fielded clients send "" for an unattributed event
-              // (WatermelonDB backfills non-optional string columns with ""), and
-              // "" is not a valid uuid literal.
-              recorded_by_user_id: event.recorded_by_user_id || null,
-            })
-            .onConflict((oc) => {
-              return (
-                oc
-                  .column("id")
-                  .doUpdateSet({
-                    patient_id: (eb) => eb.ref("excluded.patient_id"),
-                    visit_id: (eb) => eb.ref("excluded.visit_id"),
-                    form_id: (eb) => eb.ref("excluded.form_id"),
-                    event_type: (eb) => eb.ref("excluded.event_type"),
-                    form_data: (eb) => eb.ref("excluded.form_data"),
-                    metadata: (eb) => eb.ref("excluded.metadata"),
-                    is_deleted: (eb) => eb.ref("excluded.is_deleted"),
-                    recorded_by_user_id: (eb) =>
-                      eb.ref("excluded.recorded_by_user_id"),
-                    updated_at: sql`now()::timestamp with time zone`,
-                    last_modified: sql`now()::timestamp with time zone`,
-                  })
-                  // Only update if the incoming record is newer than what's already stored
-                  .where(sql<boolean>`excluded.updated_at > events.updated_at`)
-              );
-            })
-            .executeTakeFirst();
+          return await upsertRows([
+            toInsertRow(event, id || event.id || uuidV1(), visitId),
+          ]).executeTakeFirst();
           // InsertResult is undefined when the updated_at guard skips a stale record
         } catch (error) {
           Logger.error({
@@ -307,6 +325,72 @@ namespace Event {
           });
           throw error;
         }
+      },
+    );
+
+    /**
+     * Which of the events' visit ids the database actually holds. Matches
+     * `Visit.API.findById`, which `save` uses for the same check: a soft-deleted
+     * visit still counts as one that exists.
+     */
+    const storedVisitIdsFor = async (
+      events: readonly Event.EncodedT[],
+    ): Promise<Set<string>> => {
+      const candidates = new Set<string>();
+      for (const event of events) {
+        if (typeof event.visit_id === "string" && isValidUUID(event.visit_id)) {
+          candidates.add(event.visit_id);
+        }
+      }
+      if (candidates.size === 0) return new Set();
+      const rows = await db
+        .selectFrom(Visit.Table.name)
+        .select("id")
+        .where("id", "in", [...candidates])
+        .execute();
+      return new Set(rows.map((row) => row.id));
+    };
+
+    /**
+     * Upsert many events in one statement.
+     *
+     * Only events already pointing at a stored visit are batched. `save` mints a
+     * fallback visit for the rest, a read and a write at a time, so those are
+     * handed back to it. So is an event with no usable id, or a second event
+     * claiming an id already in the batch: `ON CONFLICT DO UPDATE` cannot touch
+     * one row twice in a statement.
+     */
+    export const saveMany = createServerOnlyFn(
+      async (
+        events: readonly Event.EncodedT[],
+      ): Promise<SyncBatchUpsert<Event.EncodedT>> => {
+        const storedVisitIds = await storedVisitIdsFor(events);
+
+        const batched: Event.EncodedT[] = [];
+        const deferred: Event.EncodedT[] = [];
+        const claimed = new Set<string>();
+        for (const event of events) {
+          const batchable =
+            typeof event.id === "string" &&
+            event.id.length > 0 &&
+            !claimed.has(event.id) &&
+            typeof event.visit_id === "string" &&
+            storedVisitIds.has(event.visit_id);
+          if (!batchable) {
+            deferred.push(event);
+            continue;
+          }
+          claimed.add(event.id);
+          batched.push(event);
+        }
+        if (batched.length === 0) return { acceptedIds: [], deferred };
+
+        const written = await upsertRows(
+          batched.map((event) => toInsertRow(event, event.id, event.visit_id)),
+        )
+          .returning("id")
+          .execute();
+        return { acceptedIds: written.map((row) => String(row.id)), deferred };
       },
     );
 
@@ -458,6 +542,12 @@ namespace Event {
     export const upsertFromDelta = createServerOnlyFn(
       async (delta: Event.EncodedT) => {
         return API.save(delta.id, delta);
+      },
+    );
+
+    export const upsertManyFromDelta = createServerOnlyFn(
+      async (deltas: readonly Event.EncodedT[]) => {
+        return API.saveMany(deltas);
       },
     );
 

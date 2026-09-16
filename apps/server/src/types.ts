@@ -16,3 +16,16 @@ export type RequestCaller =
       // Trusted peers: other servers and local sync hubs.
       device: Device.Table.Devices;
     };
+
+/**
+ * What one batched sync upsert settled.
+ *
+ * `acceptedIds` names the records the statement wrote; anything sent but absent
+ * from it was turned away by the staleness guard. `deferred` holds what the
+ * batch could not settle, which the caller upserts one at a time — so deferring
+ * never drops a record.
+ */
+export type SyncBatchUpsert<T> = {
+  acceptedIds: string[];
+  deferred: T[];
+};

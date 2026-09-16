@@ -24,9 +24,9 @@ const syncLimiter = createRateLimiter({
 /**
  * Per-table record counts for one push.
  *
- * Counts and table names only: the caller logs this through
- * `Logger.Production`, which reaches production logs and must stay free of
- * PHI. Runs before any validation, so it tolerates a malformed body.
+ * Counts and table names only: the caller logs these through
+ * `Logger.Production`, which must stay free of PHI. Guards every field because
+ * it runs on an unvalidated body.
  */
 const pushCountsByTable = (body: unknown): Record<string, number> => {
   if (!body || typeof body !== "object") return {};
@@ -89,9 +89,8 @@ export const Route = createFileRoute("/api/v2/sync")({
             request,
             peerType,
           );
-          // `return await`, not `return`: a bare return hands the promise back
-          // unawaited, so a rejection inside the async branch below escapes this
-          // try/catch and reaches the client as an unhandled 500.
+          // `return await`, not `return`: a bare return leaves the promise
+          // unawaited, so a rejection below escapes this catch as a 500.
           return await match(authenticatedCaller)
             .with({ ok: false }, () => {
               return new Response(JSON.stringify({ error: "Unauthorized" }), {

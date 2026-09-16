@@ -157,6 +157,180 @@ export const recordLevelErrorCode = (error: unknown): string | null => {
   return null;
 };
 
+/**
+ * How many record writes a single push may have in flight at once.
+ *
+ * The push is latency-bound — one round trip per record — so overlapping them
+ * is the whole win. Each in-flight write holds a connection from the same pool
+ * (`DB_POOL_MAX`, default 20) every other request draws from, so raise the two
+ * together.
+ */
+const SYNC_WRITE_CONCURRENCY_CEILING = 32;
+const configuredWriteConcurrency = Number(process.env.SYNC_WRITE_CONCURRENCY);
+const SYNC_WRITE_CONCURRENCY =
+  Number.isInteger(configuredWriteConcurrency) && configuredWriteConcurrency > 0
+    ? Math.min(configuredWriteConcurrency, SYNC_WRITE_CONCURRENCY_CEILING)
+    : 8;
+
+/**
+ * Run `work` over `items` with at most `limit` calls in flight, returning the
+ * results in input order.
+ *
+ * The first throw stops new work being launched and is rethrown once the
+ * in-flight calls settle. Whatever was written before that stays written: a
+ * push is not transactional either way, and the client retries whatever it was
+ * not told about.
+ */
+const mapBounded = async <T, R>(
+  items: readonly T[],
+  limit: number,
+  work: (item: T) => Promise<R>,
+): Promise<R[]> => {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  // A flag, not a truthy check on `failure`: a thrown `undefined` must still
+  // stop the run.
+  let failed = false;
+  let failure: unknown;
+  const drain = async (): Promise<void> => {
+    while (!failed) {
+      const index = next++;
+      if (index >= items.length) return;
+      try {
+        results[index] = await work(items[index]);
+      } catch (error) {
+        if (!failed) {
+          failed = true;
+          failure = error;
+        }
+        return;
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, drain),
+  );
+  if (failed) throw failure;
+  return results;
+};
+
+/** What the client is told about one record, or null when it is never told. */
+type RecordFate = { id: string; accepted: boolean } | null;
+
+type CleanedRecord = Record<string, unknown>;
+
+/** One record ready to write, paired with its position in the client's payload. */
+type PendingRecord = { index: number; cleaned: CleanedRecord };
+
+/**
+ * A model's batched upsert, as the runner needs to call it. Structural rather
+ * than imported, so a model owes nothing to this module.
+ *
+ * The entries a model returns in `deferred` must be the very objects it was
+ * given: the runner matches them by identity.
+ */
+type BatchUpsert = (
+  deltas: readonly CleanedRecord[],
+) => Promise<{ acceptedIds: string[]; deferred: CleanedRecord[] }>;
+
+/**
+ * Rows per batched INSERT. Postgres caps a statement at 65535 bind parameters;
+ * at roughly 15 columns a row this leaves an order of magnitude of headroom.
+ */
+const SYNC_BATCH_ROWS = 500;
+
+/**
+ * Drop the columns a table does not have and coerce what Postgres would reject.
+ *
+ * Unknown columns are WatermelonDB's bookkeeping (`_status`, `_changed`). The
+ * date coercions are gated on the column actually being a date: without that
+ * gate, 10-13 digit phone numbers, government IDs and external patient IDs trip
+ * the epoch regex and overwrite their text columns with ISO timestamps.
+ */
+const cleanRecordForTable = (
+  tableName: string,
+  knownColumns: ReadonlySet<string>,
+  record: Record<string, unknown>,
+): CleanedRecord =>
+  Object.fromEntries(
+    Object.entries(record)
+      .filter(([key]) => {
+        if (knownColumns.has(key)) return true;
+        Logger.warn(
+          `[sync] Ignoring unknown column "${key}" for table "${tableName}"`,
+        );
+        return false;
+      })
+      .map(([key, value]) => {
+        if (isDateColumn(tableName, key) && isEpochTimestamp(value)) {
+          Logger.warn(
+            `[sync] Converting epoch timestamp in "${tableName}.${key}": ${value}`,
+          );
+          return [key, toSafeDateString(value)];
+        }
+        // Mobile clients may send 0/"0" for empty date fields — coerce to null
+        if ((value === 0 || value === "0") && isDateColumn(tableName, key)) {
+          Logger.warn(
+            `[sync] Converting zero date to null in "${tableName}.${key}"`,
+          );
+          return [key, null];
+        }
+        return [key, value];
+      }),
+  );
+
+/**
+ * Write `pending` through a model's batched upsert, recording each record's
+ * fate and returning the ones the batch did not settle.
+ *
+ * A failed chunk is handed back whole rather than classified here: the
+ * statement is atomic, so none of it landed, and the per-record path that
+ * receives it already knows which failures belong to one record.
+ */
+const upsertInChunks = async (
+  tableName: string,
+  upsertMany: BatchUpsert,
+  pending: readonly PendingRecord[],
+  fates: RecordFate[],
+  reportable: boolean,
+): Promise<PendingRecord[]> => {
+  const oneByOne: PendingRecord[] = [];
+  for (let start = 0; start < pending.length; start += SYNC_BATCH_ROWS) {
+    const chunk = pending.slice(start, start + SYNC_BATCH_ROWS);
+    let settled: Awaited<ReturnType<BatchUpsert>>;
+    try {
+      settled = await upsertMany(chunk.map((entry) => entry.cleaned));
+    } catch (error) {
+      // The SQLSTATE and nothing else: a 22xxx/23xxx message quotes the value
+      // that offended it, and on these tables that value is patient data. The
+      // driver's own error stays on the dev-only logger below.
+      const code = (error as { code?: unknown }).code;
+      Logger.Production.warn({
+        msg: "[sync] batched upsert failed, falling back to one write per record",
+        table: tableName,
+        rows: chunk.length,
+        code: typeof code === "string" ? code : null,
+      });
+      Logger.error({ msg: "[sync] batched upsert error", error });
+      oneByOne.push(...chunk);
+      continue;
+    }
+    const accepted = new Set(settled.acceptedIds);
+    const handedBack = new Set(settled.deferred);
+    for (const entry of chunk) {
+      if (handedBack.has(entry.cleaned)) {
+        oneByOne.push(entry);
+        continue;
+      }
+      if (reportable) {
+        const id = String(entry.cleaned.id);
+        fates[entry.index] = { id, accepted: accepted.has(id) };
+      }
+    }
+  }
+  return oneByOne;
+};
+
 namespace Sync {
   const pushTableNameModelMap = ENTITIES_TO_PULL_FROM_MOBILE.reduce(
     (acc, entity) => {
@@ -578,44 +752,14 @@ namespace Sync {
         Object.keys(tableModelMap[tableName].Table.columns),
       );
 
-      for (const record of deltaData.created.concat(deltaData.updated)) {
-        // Strip unknown columns (e.g. WatermelonDB's _status, _changed) and
-        // convert raw epoch timestamps to ISO strings so PostgreSQL can parse them.
-        const cleaned = Object.fromEntries(
-          Object.entries(record)
-            .filter(([key]) => {
-              if (knownColumns.has(key)) return true;
-              Logger.warn(
-                `[sync] Ignoring unknown column "${key}" for table "${tableName}"`,
-              );
-              return false;
-            })
-            .map(([key, value]) => {
-              // Only coerce numeric values into ISO strings on actual date
-              // columns. Without the column gate, 10-13 digit phone numbers
-              // / government IDs / external patient IDs trip the epoch regex
-              // and overwrite their text columns with ISO timestamps.
-              if (isDateColumn(tableName, key) && isEpochTimestamp(value)) {
-                Logger.warn(
-                  `[sync] Converting epoch timestamp in "${tableName}.${key}": ${value}`,
-                );
-                return [key, toSafeDateString(value)];
-              }
-              // Mobile clients may send 0/"0" for empty date fields — coerce to null
-              if (
-                (value === 0 || value === "0") &&
-                isDateColumn(tableName, key)
-              ) {
-                Logger.warn(
-                  `[sync] Converting zero date to null in "${tableName}.${key}"`,
-                );
-                return [key, null];
-              }
-              return [key, value];
-            }),
-        );
+      // Fates are collected by position so `note` still runs in payload order
+      // however the writes interleave, keeping `outcome.rejected` stable.
+      const records = deltaData.created.concat(deltaData.updated);
+      const fates = new Array<RecordFate>(records.length);
 
-        // Hub authorization: reject records targeting clinics the hub isn't assigned to
+      const pending: PendingRecord[] = [];
+      records.forEach((record, index) => {
+        const cleaned = cleanRecordForTable(tableName, knownColumns, record);
         if (
           hubAuthorizedClinicIds &&
           !isRecordAuthorizedForClinic(
@@ -629,10 +773,29 @@ namespace Sync {
             `[sync] Hub not authorized to push "${tableName}" record ${cleaned.id} — ` +
               `clinic ${cleaned[clinicColumn!]} not in hub's authorized clinics`,
           );
-          if (reportable) note(mobileName, String(cleaned.id), false);
-          continue;
+          if (reportable) {
+            fates[index] = { id: String(cleaned.id), accepted: false };
+          }
+          return;
         }
+        pending.push({ index, cleaned });
+      });
 
+      const batchUpsert = (
+        tableModelMap[tableName].Sync as { upsertManyFromDelta?: BatchUpsert }
+      ).upsertManyFromDelta;
+      const oneByOne = batchUpsert
+        ? await upsertInChunks(
+            tableName,
+            batchUpsert,
+            pending,
+            fates,
+            reportable,
+          )
+        : pending;
+
+      await mapBounded(oneByOne, SYNC_WRITE_CONCURRENCY, async (entry) => {
+        const { index, cleaned } = entry;
         let upsertResult: unknown;
         try {
           upsertResult = await tableModelMap[tableName].Sync.upsertFromDelta(
@@ -651,35 +814,47 @@ namespace Sync {
               `skipping it so the rest of the push can land`,
             error,
           });
-          note(mobileName, String(cleaned.id), false);
-          continue;
+          fates[index] = { id: String(cleaned.id), accepted: false };
+          return;
         }
         if (reportable) {
-          note(
-            mobileName,
-            String(cleaned.id),
-            classifyUpsertResult(upsertResult),
-          );
+          fates[index] = {
+            id: String(cleaned.id),
+            accepted: classifyUpsertResult(upsertResult),
+          };
         }
+      });
+
+      for (const fate of fates) {
+        if (fate) note(mobileName, fate.id, fate.accepted);
       }
 
-      for (const id of deltaData.deleted) {
-        try {
-          await tableModelMap[tableName].Sync.deleteFromDelta(id);
-        } catch (error) {
-          const code = recordLevelErrorCode(error);
-          // Same rule as the upsert above. Reporting the id keeps the client's
-          // tombstone alive: WatermelonDB's `destroyDeletedRecords` filters the
-          // deleted bucket by `rejectedIds`, so the deletion is retried.
-          if (code === null || !reportable) throw error;
-          Logger.error({
-            msg:
-              `[sync] Postgres rejected the deletion of ${tableName} ${id} (${code}) — ` +
-              `skipping it so the rest of the push can land`,
-            error,
-          });
-          note(mobileName, id, false);
-        }
+      const deleteFates = await mapBounded(
+        deltaData.deleted,
+        SYNC_WRITE_CONCURRENCY,
+        async (id) => {
+          try {
+            await tableModelMap[tableName].Sync.deleteFromDelta(id);
+            return null;
+          } catch (error) {
+            const code = recordLevelErrorCode(error);
+            // Same rule as the upsert above. Reporting the id keeps the client's
+            // tombstone alive: WatermelonDB's `destroyDeletedRecords` filters the
+            // deleted bucket by `rejectedIds`, so the deletion is retried.
+            if (code === null || !reportable) throw error;
+            Logger.error({
+              msg:
+                `[sync] Postgres rejected the deletion of ${tableName} ${id} (${code}) — ` +
+                `skipping it so the rest of the push can land`,
+              error,
+            });
+            return { id, accepted: false };
+          }
+        },
+      );
+
+      for (const fate of deleteFates) {
+        if (fate) note(mobileName, fate.id, fate.accepted);
       }
     }
 
