@@ -25,6 +25,27 @@ export const Route = createFileRoute("/api/v2/sync")({
   server: {
     handlers: {
       GET: async ({ request }) => {
+        const url = new URL(request.url);
+        const peerType: Device.DeviceTypeT =
+          (url.searchParams.get("peerType") as Device.DeviceTypeT) || "unknown"; // Get the peer type or else return "unknown". Unknown is treated as a mobile to be a safe fallback.
+        const last_synced_at = Number(
+          url.searchParams.get("last_pulled_at") ||
+            url.searchParams.get("lastPulledAt") ||
+            0,
+        );
+
+        if (peerType !== Device.DEVICE_TYPE.SYNC_HUB) {
+          return new Response(
+            JSON.stringify({
+              success: true,
+              changes: {},
+              timestamp: Number.isFinite(last_synced_at)
+                ? Math.max(last_synced_at, 1)
+                : 1,
+            }),
+            { headers: { "Content-Type": "application/json" }, status: 200 },
+          );
+        }
         const ip = getClientIp(request);
         const limit = syncLimiter.check(ip);
         if (!limit.allowed) {
@@ -41,10 +62,6 @@ export const Route = createFileRoute("/api/v2/sync")({
           );
           const schemaVersion = url.searchParams.get("schemaVersion");
           const migration = url.searchParams.get("migration");
-          const peerType: Device.DeviceTypeT =
-            (url.searchParams.get("peerType") as Device.DeviceTypeT) ||
-            "unknown"; // Get the peer type or else return "unknown". Unknown is treated as a mobile to be a safe fallback.
-
           Logger.Production.info("Sync Attempt started");
           const authenticatedCaller = await authenticateRequest(
             request,
