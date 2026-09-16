@@ -21,6 +21,28 @@ const syncLimiter = createRateLimiter({
   maxRequests: 120,
 });
 
+/**
+ * Per-table record counts for one push.
+ *
+ * Counts and table names only: the caller logs this through
+ * `Logger.Production`, which reaches production logs and must stay free of
+ * PHI. Runs before any validation, so it tolerates a malformed body.
+ */
+const pushCountsByTable = (body: unknown): Record<string, number> => {
+  if (!body || typeof body !== "object") return {};
+  const counts: Record<string, number> = {};
+  const tables = Object.entries(body as Record<string, unknown>);
+  for (const [table, delta] of tables) {
+    if (!delta || typeof delta !== "object") continue;
+    const { created, updated, deleted } = delta as Record<string, unknown>;
+    counts[table] =
+      (Array.isArray(created) ? created.length : 0) +
+      (Array.isArray(updated) ? updated.length : 0) +
+      (Array.isArray(deleted) ? deleted.length : 0);
+  }
+  return counts;
+};
+
 export const Route = createFileRoute("/api/v2/sync")({
   server: {
     handlers: {
@@ -67,7 +89,10 @@ export const Route = createFileRoute("/api/v2/sync")({
             request,
             peerType,
           );
-          return match(authenticatedCaller)
+          // `return await`, not `return`: a bare return hands the promise back
+          // unawaited, so a rejection inside the async branch below escapes this
+          // try/catch and reaches the client as an unhandled 500.
+          return await match(authenticatedCaller)
             .with({ ok: false }, () => {
               return new Response(JSON.stringify({ error: "Unauthorized" }), {
                 headers: { "Content-Type": "application/json" },
@@ -131,6 +156,11 @@ export const Route = createFileRoute("/api/v2/sync")({
           return tooManyRequestsResponse(postLimit.retryAfterMs);
         }
 
+        Logger.Production.info({
+          msg: "[sync] push received",
+          contentLength: request.headers.get("content-length"),
+        });
+
         try {
           const url = new URL(request.url);
           const last_synced_at = Number(
@@ -146,7 +176,8 @@ export const Route = createFileRoute("/api/v2/sync")({
             peerType,
           );
 
-          return match(authenticatedCaller)
+          // Awaited for the same reason as the GET handler above.
+          return await match(authenticatedCaller)
             .with({ ok: false }, () => {
               return new Response(JSON.stringify({ error: "Unauthorized" }), {
                 headers: { "Content-Type": "application/json" },
@@ -155,8 +186,13 @@ export const Route = createFileRoute("/api/v2/sync")({
             })
             .with({ ok: true }, async ({ data: caller }) => {
               const body = (await request.json()) as Sync.PushRequest;
+              Logger.Production.info({
+                msg: "[sync] push body parsed",
+                counts: pushCountsByTable(body),
+              });
 
               await Sync.persistClientChanges(body, peerType, caller);
+              Logger.Production.info({ msg: "[sync] push persisted" });
               return new Response(JSON.stringify({ success: true }), {
                 headers: { "Content-Type": "application/json" },
                 status: 200,
