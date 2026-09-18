@@ -732,7 +732,7 @@ namespace Patient {
 
         // Registration date filter on p.created_at
         const regDateClause = buildDateRangeClause(
-          "p.created_at",
+          "p.server_created_at",
           registrationDateStart,
           registrationDateEnd,
         );
